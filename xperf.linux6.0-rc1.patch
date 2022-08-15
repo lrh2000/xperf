@@ -1,0 +1,260 @@
+diff --git a/include/linux/tcp.h b/include/linux/tcp.h
+index a9fbe2273..515a26a85 100644
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -443,6 +443,11 @@ struct tcp_sock {
+ 	 */
+ 	struct request_sock __rcu *fastopen_rsk;
+ 	struct saved_syn *saved_syn;
++
++	bool xperf_enabled;
++	struct list_head xperf_chunks;
++	spinlock_t xperf_lock;
++	u32 xperf_high_seq;
+ };
+ 
+ enum tsq_enum {
+diff --git a/include/linux/tcp_xperf.h b/include/linux/tcp_xperf.h
+new file mode 100644
+index 000000000..7d5b6c4c0
+--- /dev/null
++++ b/include/linux/tcp_xperf.h
+@@ -0,0 +1,8 @@
++#pragma once
++
++#include <uapi/linux/xperf_kern.h>
++
++struct tcp_xperf_chunk {
++	struct list_head node;
++	struct xperf_chunk chunk[0];
++};
+diff --git a/include/uapi/linux/xperf_kern.h b/include/uapi/linux/xperf_kern.h
+new file mode 120000
+index 000000000..c9453b63f
+--- /dev/null
++++ b/include/uapi/linux/xperf_kern.h
+@@ -0,0 +1 @@
++../../../../xperf/xperf_kern.h
+\ No newline at end of file
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index 970e9a2cc..30d4eda78 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -280,6 +280,8 @@
+ #include <asm/ioctls.h>
+ #include <net/busy_poll.h>
+ 
++#include <linux/tcp_xperf.h>
++
+ /* Track pending CMSGs. */
+ enum {
+ 	TCP_CMSG_INQ = 1,
+@@ -3546,6 +3548,53 @@ static int do_tcp_setsockopt(struct sock *sk, int level, int optname,
+ 
+ 		return tcp_fastopen_reset_cipher(net, sk, key, backup_key);
+ 	}
++	case TCP_XPERF_ENABLE:
++		if (READ_ONCE(tp->xperf_enabled))
++			return -EINVAL;
++
++		lock_sock(sk);
++
++		if (READ_ONCE(tp->xperf_enabled)) {
++			release_sock(sk);
++			return -EINVAL;
++		}
++
++		spin_lock_init(&tp->xperf_lock);
++		INIT_LIST_HEAD(&tp->xperf_chunks);
++		tp->xperf_high_seq = tp->snd_nxt;
++
++		WRITE_ONCE(tp->xperf_enabled, 1);
++
++		release_sock(sk);
++
++		return 0;
++	case TCP_XPERF_ADD_CHUNK: {
++		struct tcp_xperf_chunk *chunk;
++
++		if (optlen <= sizeof(struct xperf_chunk) ||
++		    optlen + sizeof(*chunk) < sizeof(*chunk))
++			return -EINVAL;
++
++		chunk = kmalloc(optlen + sizeof(*chunk), GFP_KERNEL);
++		if (!chunk)
++			return -ENOMEM;
++
++		if (copy_from_sockptr(chunk->chunk, optval, optlen)) {
++			kfree(chunk);
++			return -EFAULT;
++		}
++
++		if (chunk->chunk[0].size != optlen) {
++			kfree(chunk);
++			return -EINVAL;
++		}
++
++		spin_lock(&tp->xperf_lock);
++		list_add_tail(&chunk->node, &tp->xperf_chunks);
++		spin_unlock(&tp->xperf_lock);
++
++		return 0;
++	}
+ 	default:
+ 		/* fallthru */
+ 		break;
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index 78b654ff4..94b9cc3f8 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -47,6 +47,8 @@
+ 
+ #include <trace/events/tcp.h>
+ 
++#include <linux/tcp_xperf.h>
++
+ /* Refresh clocks of a TCP socket,
+  * ensuring monotically increasing values.
+  */
+@@ -2582,6 +2584,130 @@ void tcp_chrono_stop(struct sock *sk, const enum tcp_chrono type)
+ 		tcp_chrono_set(tp, TCP_CHRONO_BUSY);
+ }
+ 
++static struct tcp_xperf_chunk *tcp_xperf_chunk_get(struct tcp_sock *sk)
++{
++	struct tcp_xperf_chunk *chunk;
++
++	chunk = NULL;
++	spin_lock(&sk->xperf_lock);
++
++	if (!list_empty(&sk->xperf_chunks)) {
++		chunk = list_first_entry(&sk->xperf_chunks,
++					 struct tcp_xperf_chunk, node);
++		list_del(&chunk->node);
++	}
++
++	spin_unlock(&sk->xperf_lock);
++
++	return chunk;
++}
++
++static void tcp_xperf_chunk_unget(struct tcp_sock *sk,
++				  struct tcp_xperf_chunk *chunk)
++{
++	spin_lock(&sk->xperf_lock);
++	list_add(&chunk->node, &sk->xperf_chunks);
++	spin_unlock(&sk->xperf_lock);
++}
++
++static int tcp_xperf_fill_meta(struct tcp_sock *sk, void **pbuf, size_t *plen)
++{
++	struct xperf_tcp_record *record;
++
++	if (*plen < sizeof(struct xperf_tcp_record))
++		return 0;
++
++	record = *pbuf;
++
++	record->magic[0] = XPERF_TCP_MAGIC0;
++	record->magic[1] = XPERF_TCP_MAGIC1;
++	record->magic[2] = XPERF_TCP_MAGIC2;
++
++	record->mss_cache = sk->mss_cache;
++	record->snd_cwnd = sk->snd_cwnd;
++	record->srtt_us = sk->srtt_us;
++
++	*pbuf += sizeof(struct xperf_tcp_record);
++	*plen -= sizeof(struct xperf_tcp_record);
++
++	return 1;
++}
++
++static int tcp_xperf_fill_range(struct tcp_sock *sk, void *buf, size_t len,
++				struct tcp_xperf_chunk **pchunk, int count)
++{
++	struct tcp_xperf_chunk *chunk;
++	size_t chunk_size;
++
++	if (count == 0) {
++		if (!tcp_xperf_fill_meta(sk, &buf, &len))
++			return 0;
++		++count;
++	}
++
++	chunk = *pchunk;
++	while (len > sizeof(struct xperf_chunk)) {
++		if (!chunk)
++			chunk = tcp_xperf_chunk_get(sk);
++		if (!chunk)
++			break;
++
++		chunk_size = chunk->chunk[0].size;
++		if (len < chunk_size)
++			break;
++
++		memcpy(buf, chunk->chunk, chunk_size);
++		++count;
++
++		chunk_size = ALIGN(chunk_size, 4);
++		if (chunk_size > len)
++			chunk_size = len;
++
++		buf += chunk_size;
++		len -= chunk_size;
++
++		kfree(chunk);
++		chunk = NULL;
++	}
++
++	*pchunk = chunk;
++
++	return count;
++}
++
++static void tcp_xperf_fill_skb(struct tcp_sock *sk, struct sk_buff *skb)
++{
++	int count;
++	void *buf;
++	size_t len;
++	struct skb_shared_info *shinfo;
++	skb_frag_t *frags;
++	struct tcp_xperf_chunk *chunk;
++	unsigned int i;
++
++	count = 0;
++	chunk = NULL;
++
++	len = skb_headlen(skb);
++	if (len != 0) {
++		buf = skb->data;
++		count = tcp_xperf_fill_range(sk, buf, len, &chunk, 0);
++	}
++
++	shinfo = skb_shinfo(skb);
++	frags = shinfo->frags;
++	for (i = 0; i < shinfo->nr_frags; ++i) {
++		len = frags[i].bv_len;
++		buf = page_address(frags[i].bv_page) + frags[i].bv_offset;
++		count = tcp_xperf_fill_range(sk, buf, len, &chunk, count);
++	}
++
++	if (chunk)
++		tcp_xperf_chunk_unget(sk, chunk);
++
++	sk->xperf_high_seq = TCP_SKB_CB(skb)->end_seq;
++}
++
+ /* This routine writes packets to the network.  It advances the
+  * send_head.  This happens as incoming acks open up the remote
+  * window for us.
+@@ -2688,6 +2814,10 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
+ 		if (TCP_SKB_CB(skb)->end_seq == TCP_SKB_CB(skb)->seq)
+ 			break;
+ 
++		if (tp->xperf_enabled &&
++		    !before(TCP_SKB_CB(skb)->seq, tp->xperf_high_seq))
++			tcp_xperf_fill_skb(tp, skb);
++
+ 		if (unlikely(tcp_transmit_skb(sk, skb, 1, gfp)))
+ 			break;
+ 
