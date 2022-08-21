@@ -12,8 +12,10 @@ struct xperf_chunk {
 struct xperf_tcp_record {
 	unsigned int magic[3];
 	unsigned int mss_cache;
+	unsigned long long stamp;
 	unsigned int snd_cwnd;
-	unsigned int srtt_us;
+	unsigned int min_rtt;
+	unsigned int blt_bw;
 } __attribute__((packed));
 
 // FIXME: Assume little endien

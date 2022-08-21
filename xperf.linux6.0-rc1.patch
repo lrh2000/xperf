@@ -28,6 +28,30 @@ index 000000000..7d5b6c4c0
 +	struct list_head node;
 +	struct xperf_chunk chunk[0];
 +};
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index d10962b9f..4104f0ac4 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -1056,6 +1056,8 @@ struct rate_sample {
+ 	bool is_ack_delayed;	/* is this (likely) a delayed ACK? */
+ };
+ 
++struct xperf_tcp_record;
++
+ struct tcp_congestion_ops {
+ /* fast path fields are put first to fill one cache line */
+ 
+@@ -1096,6 +1098,10 @@ struct tcp_congestion_ops {
+ 	size_t (*get_info)(struct sock *sk, u32 ext, int *attr,
+ 			   union tcp_cc_info *info);
+ 
++	/* fill xperf's metadata (optional) */
++	void (*xperf_fill)(const struct sock *sk,
++			   struct xperf_tcp_record *record);
++
+ 	char 			name[TCP_CA_NAME_MAX];
+ 	struct module		*owner;
+ 	struct list_head	list;
 diff --git a/include/uapi/linux/xperf_kern.h b/include/uapi/linux/xperf_kern.h
 new file mode 120000
 index 000000000..c9453b63f
@@ -129,8 +153,45 @@ index 970e9a2cc..9e5861412 100644
  	default:
  		/* fallthru */
  		break;
+diff --git a/net/ipv4/tcp_bbr.c b/net/ipv4/tcp_bbr.c
+index 54eec33c6..0d8765bda 100644
+--- a/net/ipv4/tcp_bbr.c
++++ b/net/ipv4/tcp_bbr.c
+@@ -65,6 +65,8 @@
+ #include <linux/random.h>
+ #include <linux/win_minmax.h>
+ 
++#include <linux/tcp_xperf.h>
++
+ /* Scale factor for rate in pkt/uSec unit to avoid truncation in bandwidth
+  * estimation. The rate unit ~= (1500 bytes / 1 usec / 2^24) ~= 715 bps.
+  * This handles bandwidths from 0.06pps (715bps) to 256Mpps (3Tbps) in a u32.
+@@ -1139,6 +1141,15 @@ static void bbr_set_state(struct sock *sk, u8 new_state)
+ 	}
+ }
+ 
++static void bbr_xperf_fill(const struct sock *sk,
++			   struct xperf_tcp_record *record)
++{
++	const struct bbr *bbr = inet_csk_ca(sk);
++
++	record->min_rtt = bbr->min_rtt_us;
++	record->blt_bw = bbr_bw(sk);
++}
++
+ static struct tcp_congestion_ops tcp_bbr_cong_ops __read_mostly = {
+ 	.flags		= TCP_CONG_NON_RESTRICTED,
+ 	.name		= "bbr",
+@@ -1152,6 +1163,7 @@ static struct tcp_congestion_ops tcp_bbr_cong_ops __read_mostly = {
+ 	.min_tso_segs	= bbr_min_tso_segs,
+ 	.get_info	= bbr_get_info,
+ 	.set_state	= bbr_set_state,
++	.xperf_fill     = bbr_xperf_fill,
+ };
+ 
+ BTF_SET8_START(tcp_bbr_check_kfunc_ids)
 diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
-index 78b654ff4..94b9cc3f8 100644
+index 78b654ff4..fb50da4ca 100644
 --- a/net/ipv4/tcp_output.c
 +++ b/net/ipv4/tcp_output.c
 @@ -47,6 +47,8 @@
@@ -142,42 +203,46 @@ index 78b654ff4..94b9cc3f8 100644
  /* Refresh clocks of a TCP socket,
   * ensuring monotically increasing values.
   */
-@@ -2582,6 +2584,130 @@ void tcp_chrono_stop(struct sock *sk, const enum tcp_chrono type)
+@@ -2582,6 +2584,146 @@ void tcp_chrono_stop(struct sock *sk, const enum tcp_chrono type)
  		tcp_chrono_set(tp, TCP_CHRONO_BUSY);
  }
  
-+static struct tcp_xperf_chunk *tcp_xperf_chunk_get(struct tcp_sock *sk)
++static struct tcp_xperf_chunk *tcp_xperf_chunk_get(struct tcp_sock *tp)
 +{
 +	struct tcp_xperf_chunk *chunk;
 +
 +	chunk = NULL;
-+	spin_lock(&sk->xperf_lock);
++	spin_lock(&tp->xperf_lock);
 +
-+	if (!list_empty(&sk->xperf_chunks)) {
-+		chunk = list_first_entry(&sk->xperf_chunks,
++	if (!list_empty(&tp->xperf_chunks)) {
++		chunk = list_first_entry(&tp->xperf_chunks,
 +					 struct tcp_xperf_chunk, node);
 +		list_del(&chunk->node);
 +	}
 +
-+	spin_unlock(&sk->xperf_lock);
++	spin_unlock(&tp->xperf_lock);
 +
 +	return chunk;
 +}
 +
-+static void tcp_xperf_chunk_unget(struct tcp_sock *sk,
++static void tcp_xperf_chunk_unget(struct tcp_sock *tp,
 +				  struct tcp_xperf_chunk *chunk)
 +{
-+	spin_lock(&sk->xperf_lock);
-+	list_add(&chunk->node, &sk->xperf_chunks);
-+	spin_unlock(&sk->xperf_lock);
++	spin_lock(&tp->xperf_lock);
++	list_add(&chunk->node, &tp->xperf_chunks);
++	spin_unlock(&tp->xperf_lock);
 +}
 +
-+static int tcp_xperf_fill_meta(struct tcp_sock *sk, void **pbuf, size_t *plen)
++static int tcp_xperf_fill_meta(struct sock *sk, void **pbuf, size_t *plen)
 +{
++	struct tcp_sock *tp;
 +	struct xperf_tcp_record *record;
++	const struct tcp_congestion_ops *ca_ops;
 +
 +	if (*plen < sizeof(struct xperf_tcp_record))
 +		return 0;
++
++	tp = tcp_sk(sk);
 +
 +	record = *pbuf;
 +
@@ -185,9 +250,15 @@ index 78b654ff4..94b9cc3f8 100644
 +	record->magic[1] = XPERF_TCP_MAGIC1;
 +	record->magic[2] = XPERF_TCP_MAGIC2;
 +
-+	record->mss_cache = sk->mss_cache;
-+	record->snd_cwnd = sk->snd_cwnd;
-+	record->srtt_us = sk->srtt_us;
++	// FIXME: assume the unit of ktime_t is ns
++	record->stamp = ktime_mono_to_real(tp->tcp_clock_cache);
++
++	record->mss_cache = tp->mss_cache;
++	record->snd_cwnd = tp->snd_cwnd;
++
++	ca_ops = inet_csk(sk)->icsk_ca_ops;
++	if (ca_ops->xperf_fill)
++		ca_ops->xperf_fill(sk, record);
 +
 +	*pbuf += sizeof(struct xperf_tcp_record);
 +	*plen -= sizeof(struct xperf_tcp_record);
@@ -195,11 +266,14 @@ index 78b654ff4..94b9cc3f8 100644
 +	return 1;
 +}
 +
-+static int tcp_xperf_fill_range(struct tcp_sock *sk, void *buf, size_t len,
++static int tcp_xperf_fill_range(struct sock *sk, void *buf, size_t len,
 +				struct tcp_xperf_chunk **pchunk, int count)
 +{
++	struct tcp_sock *tp;
 +	struct tcp_xperf_chunk *chunk;
 +	size_t chunk_size;
++
++	tp = tcp_sk(sk);
 +
 +	if (count == 0) {
 +		if (!tcp_xperf_fill_meta(sk, &buf, &len))
@@ -210,7 +284,7 @@ index 78b654ff4..94b9cc3f8 100644
 +	chunk = *pchunk;
 +	while (len > sizeof(struct xperf_chunk)) {
 +		if (!chunk)
-+			chunk = tcp_xperf_chunk_get(sk);
++			chunk = tcp_xperf_chunk_get(tp);
 +		if (!chunk)
 +			break;
 +
@@ -237,8 +311,9 @@ index 78b654ff4..94b9cc3f8 100644
 +	return count;
 +}
 +
-+static void tcp_xperf_fill_skb(struct tcp_sock *sk, struct sk_buff *skb)
++static void tcp_xperf_fill_skb(struct sock *sk, struct sk_buff *skb)
 +{
++	struct tcp_sock *tp;
 +	int count;
 +	void *buf;
 +	size_t len;
@@ -246,6 +321,8 @@ index 78b654ff4..94b9cc3f8 100644
 +	skb_frag_t *frags;
 +	struct tcp_xperf_chunk *chunk;
 +	unsigned int i;
++
++	tp = tcp_sk(sk);
 +
 +	count = 0;
 +	chunk = NULL;
@@ -265,21 +342,21 @@ index 78b654ff4..94b9cc3f8 100644
 +	}
 +
 +	if (chunk)
-+		tcp_xperf_chunk_unget(sk, chunk);
++		tcp_xperf_chunk_unget(tp, chunk);
 +
-+	sk->xperf_high_seq = TCP_SKB_CB(skb)->end_seq;
++	tp->xperf_high_seq = TCP_SKB_CB(skb)->end_seq;
 +}
 +
  /* This routine writes packets to the network.  It advances the
   * send_head.  This happens as incoming acks open up the remote
   * window for us.
-@@ -2688,6 +2814,10 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
+@@ -2688,6 +2830,10 @@ static bool tcp_write_xmit(struct sock *sk, unsigned int mss_now, int nonagle,
  		if (TCP_SKB_CB(skb)->end_seq == TCP_SKB_CB(skb)->seq)
  			break;
  
 +		if (tp->xperf_enabled &&
 +		    !before(TCP_SKB_CB(skb)->seq, tp->xperf_high_seq))
-+			tcp_xperf_fill_skb(tp, skb);
++			tcp_xperf_fill_skb(sk, skb);
 +
  		if (unlikely(tcp_transmit_skb(sk, skb, 1, gfp)))
  			break;
