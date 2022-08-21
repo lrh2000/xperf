@@ -37,7 +37,7 @@ index 000000000..c9453b63f
 +../../../../xperf/xperf_kern.h
 \ No newline at end of file
 diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
-index 970e9a2cc..30d4eda78 100644
+index 970e9a2cc..9e5861412 100644
 --- a/net/ipv4/tcp.c
 +++ b/net/ipv4/tcp.c
 @@ -280,6 +280,8 @@
@@ -49,7 +49,33 @@ index 970e9a2cc..30d4eda78 100644
  /* Track pending CMSGs. */
  enum {
  	TCP_CMSG_INQ = 1,
-@@ -3546,6 +3548,53 @@ static int do_tcp_setsockopt(struct sock *sk, int level, int optname,
+@@ -2852,12 +2854,25 @@ bool tcp_check_oom(struct sock *sk, int shift)
+ 	return too_many_orphans || out_of_socket_memory;
+ }
+ 
++static void tcp_xperf_cleanup(struct tcp_sock *sk)
++{
++	struct tcp_xperf_chunk *cur, *next;
++
++	list_for_each_entry_safe(cur, next, &sk->xperf_chunks, node) {
++		list_del(&cur->node);
++		kfree(cur);
++	}
++}
++
+ void __tcp_close(struct sock *sk, long timeout)
+ {
+ 	struct sk_buff *skb;
+ 	int data_was_unread = 0;
+ 	int state;
+ 
++	if (READ_ONCE(tcp_sk(sk)->xperf_enabled))
++		tcp_xperf_cleanup(tcp_sk(sk));
++
+ 	sk->sk_shutdown = SHUTDOWN_MASK;
+ 
+ 	if (sk->sk_state == TCP_LISTEN) {
+@@ -3546,6 +3561,53 @@ static int do_tcp_setsockopt(struct sock *sk, int level, int optname,
  
  		return tcp_fastopen_reset_cipher(net, sk, key, backup_key);
  	}
