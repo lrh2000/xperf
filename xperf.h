@@ -52,16 +52,19 @@ xperf_chunk_start_write(const char *name, void **pbuf, size_t *psize)
 	return chunk;
 }
 
-static inline void xperf_chunk_end_write(struct xperf_chunk *chunk, size_t size)
+static inline size_t xperf_chunk_end_write(struct xperf_chunk *chunk,
+					   size_t size)
 {
 	size_t new_size;
 
 	new_size = chunk->size + size;
 	if (new_size < size || new_size > 65535)
-		return;
+		return 0;
 
 	chunk->size = new_size;
 	chunk->magic = XPERF_MAGIC;
+
+	return new_size;
 }
 
 static inline struct xperf_chunk *xperf_chunk_lookup(void **pbuf, size_t *psize)
