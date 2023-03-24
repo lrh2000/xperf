@@ -1,5 +1,5 @@
 #include "xperf.h"
-
+#include "xperf_monitor.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -172,210 +172,16 @@ static int xperf_run(int fd)
 	return 0;
 }
 
-struct xperf_monitor_file {
-	const char *name;
-	int fd;
-	int wd;
-};
-
-struct xperf_monitor {
-	int sock_fd;
-	int watch_fd;
-
-	union {
-		struct xperf_chunk chunk;
-		char chunk_buf[4096];
-	};
-
-	unsigned int file_cnt;
-	struct xperf_monitor_file files[];
-};
-
-static struct xperf_monitor *xperf_monitor_create(int sock_fd, char **filenames,
-						  int file_cnt)
+static ssize_t xperf_emit_chunk(void *ctx, const void *buf, size_t len)
 {
-	struct xperf_monitor *monitor;
-	struct xperf_monitor_file *files;
-	int i, wfd;
-
-	if (file_cnt > 10) {
-		fprintf(stderr, "xperf_monitor_create: Too many files\n");
-		goto out;
+	if (setsockopt((unsigned long)ctx, SOL_TCP, TCP_XPERF_ADD_CHUNK, buf,
+		       len) < 0) {
+		fprintf(stderr, "xperf_emit_chunk: setsockopt: %s",
+			strerror(errno));
+		return len;
 	}
 
-	wfd = inotify_init();
-	if (wfd < 0) {
-		perror("xperf_monitor_create: inotify_init");
-		goto out;
-	}
-
-	monitor = malloc(sizeof(struct xperf_monitor) +
-			 sizeof(struct xperf_monitor_file) * file_cnt);
-	if (!monitor) {
-		fprintf(stderr,
-			"xperf_monitor_create: malloc: Out of memory\n");
-		goto out_close;
-	}
-
-	files = monitor->files;
-	for (i = 0; i < file_cnt; ++i) {
-		files[i].wd = inotify_add_watch(wfd, filenames[i], IN_MODIFY);
-		if (files[i].wd < 0) {
-			fprintf(stderr,
-				"xperf_monitor_create: inotify_add_watch(%s): %s\n",
-				filenames[i], strerror(errno));
-			goto out_for;
-		}
-
-		files[i].fd = open(filenames[i], O_RDONLY);
-		if (files[i].fd < 0) {
-			fprintf(stderr, "xperf_monitor_create: open(%s): %s\n",
-				filenames[i], strerror(errno));
-			goto out_for;
-		}
-
-		files[i].name = basename(filenames[i]);
-	}
-
-	monitor->sock_fd = sock_fd;
-	monitor->watch_fd = wfd;
-	monitor->file_cnt = file_cnt;
-
-	return monitor;
-
-out_for:
-	for (--i; i >= 0; --i)
-		close(files[i].fd);
-
-	free(monitor);
-out_close:
-	close(wfd);
-out:
-	return NULL;
-}
-
-static ssize_t xperf_monitor_process_file_once(struct xperf_monitor *monitor,
-					       struct xperf_monitor_file *file)
-{
-	size_t size;
-	ssize_t size_filled;
-	void *buf;
-	struct xperf_chunk *chunk;
-
-	buf = monitor->chunk_buf;
-	size = sizeof(monitor->chunk_buf);
-
-	chunk = xperf_chunk_start_write(file->name, &buf, &size);
-	assert(chunk != NULL);
-
-	size_filled = read(file->fd, buf, size);
-	if (size_filled < 0) {
-		fprintf(stderr,
-			"xperf_monitor_process_file_once(%s): read: %s\n",
-			file->name, strerror(errno));
-		return size_filled;
-	}
-	if (size_filled <= 0) {
-		return size_filled;
-	}
-
-	xperf_chunk_end_write(chunk, size_filled);
-
-	if (setsockopt(monitor->sock_fd, SOL_TCP, TCP_XPERF_ADD_CHUNK, chunk,
-		       chunk->size) < 0) {
-		fprintf(stderr,
-			"xperf_monitor_process_file_once(%s): setsockopt: %s\n",
-			file->name, strerror(errno));
-		return size_filled;
-	}
-
-	fprintf(stderr,
-		"xperf_monitor_process_file_once: chunk sent, name %s, payload %ld bytes\n",
-		chunk->name, xperf_chunk_get_data_len(chunk));
-
-	return size_filled;
-}
-
-static ssize_t xperf_monitor_process_file(struct xperf_monitor *monitor,
-					  struct xperf_monitor_file *file)
-{
-	ssize_t retval;
-
-	do
-		retval = xperf_monitor_process_file_once(monitor, file);
-	while (retval > 0);
-
-	return retval;
-}
-
-static void xperf_monitor_init(struct xperf_monitor *monitor)
-{
-	int i;
-
-	for (i = 0; i < monitor->file_cnt; ++i)
-		xperf_monitor_process_file(monitor, &monitor->files[i]);
-}
-
-static ssize_t xperf_monitor_process_event(struct xperf_monitor *monitor,
-					   const struct inotify_event *event)
-{
-	struct xperf_monitor_file *files;
-	int i;
-
-	if (!(event->mask & IN_MODIFY))
-		return 0;
-
-	files = monitor->files;
-	for (i = 0; i < monitor->file_cnt; ++i)
-		if (monitor->files[i].wd == event->wd)
-			break;
-
-	if (i == monitor->file_cnt) {
-		fprintf(stderr, "xperf_monitor_process_event: No such file\n");
-		return -1;
-	}
-
-	return xperf_monitor_process_file(monitor, &files[i]);
-}
-
-static void xperf_monitor_process_events(struct xperf_monitor *monitor,
-					 const char *buf, ssize_t len)
-{
-	const struct inotify_event *event;
-	const char *buf_end;
-
-	for (buf_end = buf + len; buf < buf_end;
-	     buf += sizeof(*event) + event->len) {
-		event = (const struct inotify_event *)buf;
-
-		xperf_monitor_process_event(monitor, event);
-	}
-}
-
-static void xperf_monitor_run(struct xperf_monitor *monitor)
-{
-	int wfd;
-	char *buf;
-	ssize_t len;
-
-	buf = malloc(4096);
-	if (!buf) {
-		fprintf(stderr, "xperf_monitor_run: malloc: Out of memory\n");
-		return;
-	}
-
-	wfd = monitor->watch_fd;
-	for (;;) {
-		len = read(wfd, buf, 4096);
-		if (len <= 0) {
-			perror("xperf_monitor_run: read");
-			break;
-		}
-
-		xperf_monitor_process_events(monitor, buf, len);
-	}
-
-	free(buf);
+	return len;
 }
 
 static void *xperf_monitor_main(void *data)
@@ -386,7 +192,10 @@ static void *xperf_monitor_main(void *data)
 
 	xperf_monitor_init(monitor);
 
-	xperf_monitor_run(monitor);
+	while (xperf_monitor_process(monitor) > 0)
+		;
+
+	xperf_monitor_destory(monitor);
 
 	return NULL;
 }
@@ -461,7 +270,9 @@ int main(int argc, char **argv)
 	if (xperf_auth(fd) < 0)
 		return 3;
 
-	monitor = xperf_monitor_create(fd, &argv[optind], argc - optind);
+	monitor = xperf_monitor_create(0, (const char **)&argv[optind],
+				       argc - optind, &xperf_emit_chunk,
+				       (void *)(unsigned long)fd, NULL);
 	if (!monitor)
 		return 4;
 
